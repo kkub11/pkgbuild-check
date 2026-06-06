@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""
+pkgbuild-check — static security analyzer for PKGBUILD files
+Usage: pkgbuild-check [PKGBUILD]
+       If no file is given, reads from stdin.
+"""
+
+import re
+import sys
+import os
+
+# ── ANSI colours ──────────────────────────────────────────────────────────────
+RESET  = "\033[0m"
+BOLD   = "\033[1m"
+RED    = "\033[31m"
+YELLOW = "\033[33m"
+GREEN  = "\033[32m"
+CYAN   = "\033[36m"
+DIM    = "\033[2m"
+NO_COLOR = not sys.stdout.isatty()
+
+def c(color, text):
+    if NO_COLOR:
+        return text
+    return f"{color}{text}{RESET}"
+
+# ── Check definitions ─────────────────────────────────────────────────────────
+
+RED_FLAGS = [
+    {
+        "id": "curl_pipe_sh",
+        "label": "Remote code execution via pipe",
+        "detail": "Piping curl/wget directly into sh/bash executes untrusted remote code.",
+        "re": re.compile(
+            r"(curl|wget)\s+[^|#\n]*\|[^|#\n]*\b(bash|sh)\b"
+        ),
+    },
+    {
+        "id": "base64_eval",
+        "label": "Obfuscated execution (base64 + eval)",
+        "detail": "Decoding and evaluating base64 strings hides malicious payloads.",
+        "re": re.compile(r"base64[^|;\n]*\|\s*\beval\b|\beval\b.*base64"),
+    },
+    {
+        "id": "eval_dynamic",
+        "label": "eval on dynamic/variable content",
+        "detail": "eval of variable content can execute arbitrary hidden commands.",
+        "re": re.compile(r'\beval\s+\$\(|\beval\s+"[^"]*\$|\beval\s+\$[A-Za-z_]'),
+    },
+    {
+        "id": "reverse_shell",
+        "label": "Reverse shell pattern",
+        "detail": "Opens a backdoor connection to an attacker-controlled host.",
+        "re": re.compile(r"/dev/tcp/|nc\s+-[el]|ncat\s+-[el]|bash\s+-i\s+>&\s*/dev/tcp"),
+    },
+    {
+        "id": "cron_persist",
+        "label": "Cron/systemd persistence injection",
+        "detail": "Writing cron jobs or enabling services from a build script creates malicious persistence.",
+        "re": re.compile(r"crontab\s+-[le]|/etc/cron|cron\.d/"),
+    },
+    {
+        "id": "ssh_keys",
+        "label": "SSH authorized_keys modification",
+        "detail": "Adding SSH keys enables persistent remote access to the victim machine.",
+        "re": re.compile(r"authorized_keys"),
+    },
+    {
+        "id": "passwd_shadow",
+        "label": "Password file tampering",
+        "detail": "Writing to /etc/passwd or /etc/shadow can create backdoor accounts.",
+        "re": re.compile(r"/etc/passwd|/etc/shadow"),
+    },
+    {
+        "id": "rm_rf_root",
+        "label": "Destructive rm -rf on system paths",
+        "detail": "rm -rf on / or system directories outside $pkgdir/$srcdir is dangerous.",
+        "re": re.compile(r"rm\s+-[rf]{1,2}\s+/(?!(tmp|var/tmp))(?!\"\$(?:pkgdir|srcdir))"),
+    },
+    {
+        "id": "crypto_miner",
+        "label": "Cryptocurrency miner indicators",
+        "detail": "Build script references known mining software or pool protocols.",
+        "re": re.compile(r"\b(xmrig|minerd|cpuminer|stratum\+tcp|monero|mining.*pool)\b", re.IGNORECASE),
+    },
+    {
+        "id": "ld_preload",
+        "label": "LD_PRELOAD injection",
+        "detail": "Setting LD_PRELOAD outside the package tree hijacks library loading system-wide.",
+        "re": re.compile(r"LD_PRELOAD\s*=(?!.*\$pkgdir)"),
+    },
+    {
+        "id": "bin_exec_download",
+        "label": "Binary download and immediate execution",
+        "detail": "Downloading then running a binary bypasses source() checksum verification.",
+        "re": re.compile(r"(curl|wget)\s+[^|;\n]+-[oO]\s+\S+\s*[;&\n]\s*(chmod|\./|sh\s)"),
+    },
+]
+
+WARNINGS = [
+    {
+        "id": "skip_checksum",
+        "label": "Checksum skipped (SKIP keyword)",
+        "detail": "SKIP disables integrity checks — acceptable only for VCS sources, suspicious otherwise.",
+        "re": re.compile(r"\bSKIP\b"),
+    },
+    {
+        "id": "weak_checksum",
+        "label": "Weak checksum (md5sums or sha1sums)",
+        "detail": "md5 and sha1 are cryptographically broken. Use b2sums, sha256sums, or sha512sums.",
+        "re": re.compile(r"^(md5sums|sha1sums)\s*=", re.MULTILINE),
+    },
+    {
+        "id": "http_source",
+        "label": "Plain HTTP source URL",
+        "detail": "Non-HTTPS URLs are vulnerable to MITM attacks even when checksums are present.",
+        "re": re.compile(r'source\s*=\s*\([^)]*http://'),
+    },
+    {
+        "id": "external_script",
+        "label": "External script sourced at build time",
+        "detail": "Sourcing scripts from URLs at build time bypasses source() integrity verification.",
+        "re": re.compile(r"source\s+<\((curl|wget)|[.]\s+<\((curl|wget)"),
+    },
+    {
+        "id": "git_untagged",
+        "label": "VCS source without pinned tag/commit",
+        "detail": "Floating branches (master/main/HEAD) fetch unreviewed, unpinned code on every build.",
+        "re": re.compile(r"git\+https?://[^#\s\"']+[\"']|#branch=(master|main|HEAD)"),
+    },
+    {
+        "id": "install_script",
+        "label": ".install script present",
+        "detail": ".install scripts run as root post-install — review the install script separately.",
+        "re": re.compile(r"install\s*=\s*\S+\.install"),
+    },
+    {
+        "id": "chmod_world",
+        "label": "World-writable chmod (777 or o+w)",
+        "detail": "World-writable files installed onto the system are a privilege escalation risk.",
+        "re": re.compile(r"chmod\s+(777|[0-7][0-7][0-7][7]|[ugo]+\+w)"),
+    },
+    {
+        "id": "sudo_in_build",
+        "label": "sudo or su used in build functions",
+        "detail": "Build functions must not escalate privileges; makepkg handles that.",
+        "re": re.compile(r"\b(sudo|su\s+-[clm])\b"),
+    },
+]
+
+GOOD_PRACTICES = [
+    {
+        "id": "strong_checksum",
+        "label": "Strong checksum present (b2/sha256/sha512)",
+        "detail": "Source integrity is verified with a cryptographically strong hash.",
+        "fn": lambda t: bool(re.search(r"^(b2sums|sha256sums|sha512sums|sha384sums)\s*=", t, re.MULTILINE)),
+    },
+    {
+        "id": "pkgdir_in_package",
+        "label": "package() uses $pkgdir",
+        "detail": "Installations are confined to the staging directory, not written to the live system.",
+        "fn": lambda t: bool(re.search(r"package\s*\(\)", t)) and bool(re.search(r"\$pkgdir", t)),
+    },
+    {
+        "id": "srcdir_in_build",
+        "label": "Build/prepare functions use $srcdir or cd $pkgname",
+        "detail": "Build steps operate on the correct source directory.",
+        "fn": lambda t: bool(re.search(r"(build|prepare)\s*\(\)", t)) and bool(re.search(r"(\$srcdir|\$pkgname|\bcd\b)", t)),
+    },
+    {
+        "id": "destdir_pattern",
+        "label": "DESTDIR=$pkgdir used with make install",
+        "detail": "Standard way to redirect make install output into the staging directory.",
+        "fn": lambda t: bool(re.search(r'DESTDIR=["\']?\$pkgdir["\']?', t)),
+    },
+    {
+        "id": "https_source",
+        "label": "HTTPS or VCS source URL",
+        "detail": "Sources use encrypted transport — no plain HTTP URLs found.",
+        "fn": lambda t: bool(re.search(r"source\s*=\s*\(", t)) and not bool(re.search(r"source\s*=\s*\([^)]*http://", t)),
+    },
+    {
+        "id": "validpgpkeys",
+        "label": "PGP key verification (validpgpkeys)",
+        "detail": "validpgpkeys enforces upstream signature checks for extra authenticity.",
+        "fn": lambda t: bool(re.search(r"^validpgpkeys\s*=", t, re.MULTILINE)),
+    },
+    {
+        "id": "has_license",
+        "label": "License field declared",
+        "detail": "Package declares its license, following PKGBUILD guidelines.",
+        "fn": lambda t: bool(re.search(r"^license\s*=", t, re.MULTILINE)),
+    },
+    {
+        "id": "pkgver_in_source",
+        "label": "Source URL uses $pkgver",
+        "detail": "Version-pinned source URLs prevent silent download of wrong versions.",
+        "fn": lambda t: bool(re.search(r"source\s*=\s*\([^)]*\$pkgver", t)),
+    },
+    {
+        "id": "install_dm",
+        "label": "Uses install -Dm for file placement",
+        "detail": "'install -Dm' correctly sets permissions and creates parent directories atomically.",
+        "fn": lambda t: bool(re.search(r"install\s+-[A-Za-z]*D[A-Za-z]*m|install\s+-[A-Za-z]*m[A-Za-z]*D", t)),
+    },
+    {
+        "id": "has_maintainer",
+        "label": "Maintainer comment present",
+        "detail": "Identifies who is responsible for this package.",
+        "fn": lambda t: bool(re.search(r"^#\s*Maintainer:", t, re.MULTILINE)),
+    },
+]
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def check_list(text, checks):
+    hits = []
+    misses = []
+    for chk in checks:
+        if "fn" in chk:
+            matched = chk["fn"](text)
+        else:
+            m = chk["re"].search(text)
+            matched = bool(m)
+        (hits if matched else misses).append((chk, matched))
+    return hits, misses
+
+def snippet(text, pattern):
+    """Return a short matching line for display."""
+    if not isinstance(pattern, re.Pattern):
+        return None
+    m = pattern.search(text)
+    if not m:
+        return None
+    line = text[max(0, m.start()-20):m.end()+20].strip().replace("\n", " ")
+    return line[:90] + ("…" if len(line) > 90 else "")
+
+def score(reds, warns, goods_found, goods_total):
+    penalty = len(reds) * 30 + len(warns) * 10
+    bonus = min(len(goods_found) * 5, 20)
+    return max(0, min(100, 100 - penalty + bonus))
+
+# ── Rendering ─────────────────────────────────────────────────────────────────
+
+W = 68  # terminal width
+
+def hr(char="─"):
+    print(c(DIM, char * W))
+
+def header(path):
+    print()
+    label = os.path.basename(path) if path != "<stdin>" else "stdin"
+    print(c(BOLD, f"  pkgbuild-check  ─  {label}"))
+    hr()
+
+def print_finding(icon, color, label, detail, snip=None):
+    prefix = c(color, f"  {icon} ")
+    print(f"{prefix}{c(BOLD, label)}")
+    print(f"     {c(DIM, detail)}")
+    if snip:
+        print(f"     {c(DIM, '→')} {c(DIM, snip)}")
+
+def print_good(label, detail):
+    print(f"  {c(GREEN, '✓')} {label}")
+    print(f"     {c(DIM, detail)}")
+
+def print_missing(label, detail):
+    print(f"  {c(DIM, '○')} {c(DIM, label)}")
+    print(f"     {c(DIM, detail)}")
+
+def render(text, path):
+    header(path)
+
+    red_hits, _   = check_list(text, RED_FLAGS)
+    warn_hits, _  = check_list(text, WARNINGS)
+    good_hits, good_miss = check_list(text, GOOD_PRACTICES)
+    good_hits = [x[0] for x in good_hits]
+    good_miss = [x[0] for x in good_miss]
+
+    sc = score(red_hits, warn_hits, good_hits, GOOD_PRACTICES)
+
+    if red_hits:
+        verdict = c(RED,    c(BOLD, "HIGH RISK — do not install"))
+    elif len(warn_hits) >= 2:
+        verdict = c(YELLOW, c(BOLD, "SUSPICIOUS — review carefully"))
+    elif len(warn_hits) == 1:
+        verdict = c(YELLOW, c(BOLD, "MOSTLY FINE — one warning"))
+    else:
+        verdict = c(GREEN,  c(BOLD, "CLEAN"))
+
+    print(f"  Score  {c(BOLD, str(sc))}/100   {verdict}")
+    print(f"  {c(DIM, f'{len(red_hits)} critical  {len(warn_hits)} warnings  {len(good_hits)}/{len(GOOD_PRACTICES)} best practices')}")
+    print()
+
+    if red_hits:
+        print(c(RED, c(BOLD, "  CRITICAL ISSUES")))
+        hr()
+        for chk in red_hits:
+            snip = snippet(text, chk.get("re"))
+            print_finding("✗", RED, chk["label"], chk["detail"], snip)
+            print()
+
+    if warn_hits:
+        print(c(YELLOW, c(BOLD, "  WARNINGS")))
+        hr()
+        for chk in warn_hits:
+            snip = snippet(text, chk.get("re"))
+            print_finding("!", YELLOW, chk["label"], chk["detail"], snip)
+            print()
+
+    if good_hits:
+        print(c(GREEN, c(BOLD, "  GOOD PRACTICES FOUND")))
+        hr()
+        for chk in good_hits:
+            print_good(chk["label"], chk["detail"])
+            print()
+
+    if good_miss:
+        print(c(CYAN, c(BOLD, "  BEST PRACTICES NOT DETECTED")))
+        hr()
+        for chk in good_miss:
+            print_missing(chk["label"], chk["detail"])
+            print()
+
+    hr()
+    print()
+    return 2 if red_hits else (1 if warn_hits else 0)
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def main():
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    flags = [a for a in sys.argv[1:] if a.startswith("-")]
+
+    if "-h" in flags or "--help" in flags:
+        print(__doc__)
+        sys.exit(0)
+
+    if "--no-color" in flags:
+        global NO_COLOR
+        NO_COLOR = True
+
+    if args:
+        path = args[0]
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+        except FileNotFoundError:
+            print(f"pkgbuild-check: file not found: {path}", file=sys.stderr)
+            sys.exit(3)
+        except PermissionError:
+            print(f"pkgbuild-check: permission denied: {path}", file=sys.stderr)
+            sys.exit(3)
+    else:
+        if sys.stdin.isatty():
+            print("pkgbuild-check: reading from stdin (pass a filename or pipe a PKGBUILD)", file=sys.stderr)
+        text = sys.stdin.read()
+        path = "<stdin>"
+
+    exit_code = render(text, path)
+    sys.exit(exit_code)
+
+if __name__ == "__main__":
+    main()
