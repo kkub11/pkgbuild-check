@@ -122,13 +122,19 @@ pkgbuild-check PKGBUILD && makepkg -si
 Most AUR helpers let you drop into a shell to review the PKGBUILD before
 building. You can run `pkgbuild-check` there, or add it as a pre-build hook.
 
-Example with `paru` (edit `~/.config/paru/paru.conf`):
+Example with `yay` — use the `--editmenu` flag to open the PKGBUILD in your
+editor before each build, where you can exit and run `pkgbuild-check` manually:
 
-```ini
-[options]
-CombinedUpgrade
-# Drop to a shell before building so you can run pkgbuild-check manually
-Review
+```bash
+yay -S --editmenu <package>
+```
+
+To make this the default (edit `~/.config/yay/config.json`):
+
+```json
+{
+  "editmenu": true
+}
 ```
 
 ## Limitations
