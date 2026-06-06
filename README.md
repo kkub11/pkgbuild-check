@@ -196,6 +196,7 @@ If you want to share how your analyzer works—like whether it uses static patte
 This is a very clean, readable, and highly practical Python linter! Your script uses regex and structured rules to effectively check for many common security anti-patterns in PKGBUILD files, including dangerous shell pipes, persistence injection, and weak cryptographic signatures.
 
 However, because PKGBUILD files are written in Bash, relying purely on text-based regular expressions means an attacker can easily bypass your analyzer, or normal packaging choices could trigger false alarms.
+
 ------------------------------
 #### 🛑 How Your Tool Can Be Bypassed (False Negatives)
 Because regex looks for specific string sequences, an attacker can bypass your RED_FLAGS by slightly modifying their formatting or using standard Bash expansion.
@@ -235,8 +236,11 @@ Your http_source rule checks if a plain HTTP URL exists inside the source array:
 r'source\s*=\s*\([^)]*http://'
 
 If a package defines multiple sources where the first three are https:// but the fourth is http://, the [^)]* regex anchor might break or incorrectly parse multi-line arrays depending on how the brackets are formatted.
+
 #### 2. Systemd Services
+
 Your cron_persist rule flags /etc/cron or cron.d/. However, some legitimate packages genuinely need to ship system configurations. If a package installs a cron system-wide, it usually places it inside $pkgdir/etc/cron.d/. Because your regex simply scans for the string /etc/cron, it will generate a false positive even when the path is safely isolated inside $pkgdir.
+
 ------------------------------
 #### 🛠️ Concrete Code Improvements
 Here is how you can rewrite specific rules in your script to make them more resilient:
